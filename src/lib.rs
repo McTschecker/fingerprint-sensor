@@ -8,6 +8,8 @@ use std::vec::Vec;
 const STARTCODE: u16 = 0xEF01;
 const COMMANDPACKET: u8 = 0x1;
 const ACKPACKET: u8 = 0x7;
+const DATAPACKET: u8 = 0x2;
+const ENDDATAPACKET: u8 = 0x8;
 
 const VERIFYPASSWORD: u8 = 0x13;
 const TEMPLATECOUNT: u8 = 0x1D;
@@ -20,6 +22,10 @@ const REGMODEL: u8 = 0x05;
 const STORE: u8 = 0x06;
 const DELETE: u8 = 0x0C;
 const DELETEALL: u8 = 0x0D;
+const UP_CHAR: u8 = 0x08; // upload feature/character file from sensor buffer to host
+const DOWN_CHAR: u8 = 0x09; // download feature/character file from host to sensor buffer
+const UP_IMAGE: u8 = 0x0A; // upload fingerprint image from sensor to host
+const DOWN_IMAGE:u8 = 0x0B; // download fingerprint image from host to sensor
 
 pub const OK: u8 = 0x0;
 pub const NOFINGER: u8 = 0x02;
@@ -93,11 +99,11 @@ impl Device {
         r[0] == OK
     }
 
-    pub fn send_packet(&mut self, data: &[u8]) -> io::Result<()> {
+    pub fn send_packet_with_type(&mut self, packet_type: u8, data: &[u8]) -> io::Result<()> {
         let mut packet = vec![(STARTCODE >> 8) as u8, (STARTCODE & 0xFF) as u8];
 
         packet.extend_from_slice(&self.address);
-        packet.push(COMMANDPACKET);
+        packet.push(packet_type);
 
         let length = data.len() + 2;
         packet.push((length >> 8) as u8);
@@ -115,6 +121,10 @@ impl Device {
         self.uart.write_all(&packet)?;
 
         Ok(())
+    }
+
+    pub fn send_packet(&mut self, data: &[u8]) -> io::Result<()> {
+        self.send_packet_with_type(COMMANDPACKET, data)
     }
 
     pub fn get_packet(&mut self, expected: usize) -> io::Result<Vec<u8>> {
@@ -153,6 +163,44 @@ impl Device {
         self.print_debug("_get_packet reply:", &reply, "hex");
 
         Ok(reply)
+    }
+
+    pub fn get_data_packet(&mut self) -> io::Result<(u8, Vec<u8>)> {
+        let mut header = [0u8; 9];
+        self.uart.read_exact(&mut header)?;
+
+        let start = (&header[0..2]).read_u16::<BigEndian>().unwrap();
+        if start != STARTCODE {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Incorrect packet data"));
+        }
+
+        let addr = header[2..6].to_vec();
+        if addr != self.address {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Incorrect address"));
+        }
+
+        let packet_type = header[6];
+        let length = (&header[7..9]).read_u16::<BigEndian>().unwrap() as usize;
+
+        let mut payload = vec![0u8; length];
+        self.uart.read_exact(&mut payload)?;
+
+        let data = payload[0..length - 2].to_vec();
+        let checksum_bytes = &payload[length - 2..length];
+        let received_checksum = (&checksum_bytes[0..2]).read_u16::<BigEndian>().unwrap();
+
+        let mut calculated_checksum = packet_type as u16 + (length as u16 >> 8) + (length as u16 & 0xFF);
+        for &byte in &data {
+            calculated_checksum += byte as u16;
+        }
+
+        if received_checksum != calculated_checksum {
+             return Err(io::Error::new(io::ErrorKind::InvalidData, "Checksum mismatch"));
+        }
+
+        self.print_debug("get_data_packet data:", &data, "hex");
+
+        Ok((packet_type, data))
     }
 
     pub fn read_sysparam(&mut self) -> io::Result<u8> {
@@ -284,6 +332,58 @@ impl Device {
 
         let r = self.get_packet(12)?;
         Ok(r[0])
+    }
+
+    pub fn upload_template(&mut self, buffer_id: u8) -> io::Result<Vec<u8>> {
+        self.send_packet(&[UP_CHAR, buffer_id])?;
+
+        let r = self.get_packet(12)?;
+        if r[0] != OK {
+            return Err(io::Error::new(io::ErrorKind::Other, "Failed to upload template"));
+        }
+
+        let mut template = Vec::new();
+        loop {
+            let (packet_type, data) = self.get_data_packet()?;
+            template.extend_from_slice(&data);
+
+            if packet_type == ENDDATAPACKET {
+                break;
+            } else if packet_type != DATAPACKET {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Unexpected packet type"));
+            }
+        }
+
+        Ok(template)
+    }
+
+    pub fn download_template(&mut self, buffer_id: u8, template: &[u8]) -> io::Result<u8> {
+        self.send_packet(&[DOWN_CHAR, buffer_id])?;
+
+        let r = self.get_packet(12)?;
+        if r[0] != OK {
+            return Err(io::Error::new(io::ErrorKind::Other, "Failed to download template"));
+        }
+
+        let packet_size = if let Some(size_index) = self.data_packet_size {
+            32 * 2u16.pow((size_index & 0x03) as u32) as usize
+        } else {
+            128
+        };
+
+        let mut chunks = template.chunks(packet_size).peekable();
+        while let Some(chunk) = chunks.next() {
+            let packet_type = if chunks.peek().is_some() {
+                DATAPACKET
+            } else {
+                ENDDATAPACKET
+            };
+
+            self.send_packet_with_type(packet_type, chunk)?;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        Ok(OK)
     }
 
     fn print_debug(&self, message: &str, data: impl std::fmt::Debug, data_type: &str) {

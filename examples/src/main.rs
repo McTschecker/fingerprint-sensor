@@ -172,6 +172,8 @@ fn main() -> io::Result<()> {
         println!("e) enroll print");
         println!("f) find print");
         println!("d) delete print");
+        println!("u) upload print template (from sensor buffer 1)");
+        println!("w) write/download print template (to sensor buffer 2)");
         println!("q) quit");
         println!("----------------");
         print!("> ");
@@ -225,6 +227,33 @@ fn main() -> io::Result<()> {
                 match device.delete_model(finger_id) {
                     Ok(_) => println!("Deleted!"),
                     Err(_) => println!("Failed to delete"),
+                }
+            }
+            "u" => {
+                println!("Uploading template from buffer 1...");
+                match device.upload_template(1) {
+                    Ok(template) => {
+                        println!("Successfully uploaded template! Size: {} bytes", template.len());
+                        if let Err(e) = std::fs::write("template.dat", &template) {
+                            println!("Failed to save template to file: {}", e);
+                        } else {
+                            println!("Template saved to template.dat");
+                        }
+                    }
+                    Err(e) => println!("Failed to upload template: {}", e),
+                }
+            }
+            "w" => {
+                println!("Reading template from template.dat...");
+                match std::fs::read("template.dat") {
+                    Ok(template) => {
+                        println!("Downloading template to buffer 2...");
+                        match device.download_template(2, &template) {
+                            Ok(_) => println!("Successfully downloaded template to buffer 2!"),
+                            Err(e) => println!("Failed to download template: {}", e),
+                        }
+                    }
+                    Err(e) => println!("Failed to read template file: {}", e),
                 }
             }
             "q" => {
